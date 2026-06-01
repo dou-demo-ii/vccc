@@ -1,6 +1,15 @@
-checkpoints/*.pt
-checkpoints/*.pth
-checkpoints/*.ckpt
+# Model Checkpoints
+checkpoints/
+
+# Temporary files
 temp/
+
+# Python cache & environments
 __pycache__/
+*.pyc
 .venv/
+venv/
+env/
+
+
+.env
