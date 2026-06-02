@@ -1,5 +1,6 @@
 import os
 import tempfile
+from pathlib import Path
 
 import matplotlib
 
@@ -16,9 +17,55 @@ import torchaudio
 from src.model_utils import load_model
 from src.predict import predict_audio
 
-CHECKPOINT_PATH = "checkpoints/E2_best.pt"
+CHECKPOINT_DIR = "checkpoints"
+SUPPORTED_CHECKPOINT_EXTENSIONS = {".pt", ".pth", ".ckpt"}
 SR = 16000
 MAX_LEN = 64600
+
+
+def discover_checkpoints(checkpoint_dir: str = CHECKPOINT_DIR) -> list[str]:
+    """
+    Find all supported model checkpoint files inside checkpoint_dir.
+
+    Nested folders are supported, for example:
+      checkpoints/aasist3_kan/best_e8.pt
+      checkpoints/aasist3_baseline/best_e12.pt
+    """
+    base_dir = Path(checkpoint_dir)
+
+    if not base_dir.exists():
+        return []
+
+    checkpoints = [
+        str(path)
+        for path in base_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_CHECKPOINT_EXTENSIONS
+    ]
+
+    return sorted(checkpoints)
+
+
+def format_model_name(checkpoint_path: str) -> str:
+    """Create a readable model label from its checkpoint path."""
+    path = Path(checkpoint_path)
+
+    try:
+        relative_path = path.relative_to(CHECKPOINT_DIR)
+    except ValueError:
+        relative_path = path
+
+    return str(relative_path.with_suffix("")).replace("\\", " / ")
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_model(checkpoint_path: str) -> torch.nn.Module:
+    """
+    Load and cache a model checkpoint.
+
+    Switching back to a previously selected checkpoint is faster because
+    Streamlit reuses the already-loaded model instance.
+    """
+    return load_model(checkpoint_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -140,10 +187,10 @@ def plot_cqt(y: np.ndarray, sr: int, label: str = "") -> plt.Figure:
 
 def plot_spectral_profile(y: np.ndarray, sr: int) -> plt.Figure:
     """
-    Mean spectral energy profile with highlighted deepfake artefact zone.
-    Deconvolution artefacts (spectral peaks / checkerboard) from AI generative
-    models concentrate in the 6–8 kHz band on 16 kHz audio.
-    (Afchar et al., 2025)
+    Mean spectral energy profile.
+
+    The 6–8 kHz region is highlighted as an inspection zone only.
+    This plot does not independently determine whether the audio is deepfake.
     """
     S = np.abs(librosa.stft(y, n_fft=1024, hop_length=256))
     S_db = librosa.amplitude_to_db(S, ref=np.max)
@@ -152,16 +199,31 @@ def plot_spectral_profile(y: np.ndarray, sr: int) -> plt.Figure:
 
     fig, ax = _dark_fig(10, 3)
     ax.plot(freqs / 1000, mean_db, color=_ACCENT, linewidth=1.2)
-    ax.axvspan(6, 8, color=_DANGER, alpha=0.18, label="Zona artefak deepfake (6–8 kHz)")
 
-    # Annotate the artefact zone
+    # Highlight only as an inspection zone, not as proof of deepfake.
+    ax.axvspan(
+        6,
+        8,
+        color=_DANGER,
+        alpha=0.12,
+        label="Area inspeksi frekuensi tinggi (6–8 kHz)",
+    )
+
+    # Keep the annotation inside the visible plotting area.
+    idx_7khz = np.searchsorted(freqs, 7000)
+    idx_7khz = min(idx_7khz, len(mean_db) - 1)
+
     ax.annotate(
-        "Zona spectral peaks\n(artefak dekonvolusi AI)",
-        xy=(7, mean_db[np.searchsorted(freqs, 7000)]),
-        xytext=(9, mean_db.max() - 5),
+        "Area inspeksi artefak spektral\\n(bukan bukti otomatis deepfake)",
+        xy=(7, mean_db[idx_7khz]),
+        xytext=(4.55, mean_db.max() - 5),
         color=_DANGER,
         fontsize=8,
-        arrowprops=dict(arrowstyle="->", color=_DANGER, lw=1),
+        arrowprops=dict(
+            arrowstyle="->",
+            color=_DANGER,
+            lw=1,
+        ),
     )
 
     ax.set_xlabel("Frekuensi (kHz)")
@@ -171,7 +233,6 @@ def plot_spectral_profile(y: np.ndarray, sr: int) -> plt.Figure:
     _style_ax(ax, "Profil Energi Spektral")
     plt.tight_layout(pad=0.5)
     return fig
-
 
 # ═══════════════════════════════════════════════════════════════════════════ #
 #  XAI — Attention weight extraction via forward hooks
@@ -347,7 +408,37 @@ st.set_page_config(
 )
 
 st.title("VCCC — Audio Deepfake Detection")
-st.write("Aplikasi deteksi audio asli atau deepfake menggunakan model AASIST3-KAN.")
+st.write(
+    "Aplikasi deteksi audio asli atau deepfake dengan pilihan checkpoint model."
+)
+
+checkpoint_paths = discover_checkpoints()
+
+if not checkpoint_paths:
+    st.error(
+        "Checkpoint model tidak ditemukan. Tambahkan file `.pt`, `.pth`, atau `.ckpt` "
+        f"ke folder `{CHECKPOINT_DIR}`."
+    )
+    st.stop()
+
+selected_checkpoint = st.selectbox(
+    "Pilih model / checkpoint",
+    options=checkpoint_paths,
+    format_func=format_model_name,
+    help=(
+        "Daftar ini dibaca otomatis dari folder checkpoints. "
+        "Tambahkan file checkpoint baru agar muncul sebagai pilihan."
+    ),
+)
+
+selected_model_name = format_model_name(selected_checkpoint)
+st.caption(f"Model aktif: `{selected_model_name}`")
+
+if len(checkpoint_paths) == 1:
+    st.info(
+        "Saat ini baru ditemukan 1 checkpoint. Tambahkan checkpoint lain ke folder "
+        f"`{CHECKPOINT_DIR}` untuk menampilkan pilihan model tambahan."
+    )
 
 uploaded_file = st.file_uploader(
     "Upload file audio",
@@ -373,10 +464,11 @@ if uploaded_file is not None:
         try:
             # ── 1. Detection ──────────────────────────────────────────────
             with st.spinner("Memuat model dan memproses audio..."):
-                model = load_model(CHECKPOINT_PATH)
+                model = get_cached_model(selected_checkpoint)
                 result = predict_audio(model, tmp_path)
 
             st.subheader("Hasil Deteksi")
+            st.write(f"Model yang digunakan: **{selected_model_name}**")
 
             if result["class_id"] == 0:
                 st.error(f"Label Prediksi: {result['label']}")
@@ -396,10 +488,10 @@ if uploaded_file is not None:
             st.divider()
             st.subheader("📊 Visualisasi Bukti Akustik (Explainable AI)")
             st.caption(
-                "Visualisasi di bawah menjelaskan **mengapa** model menghasilkan keputusan tersebut. "
-                "CQT Spectrogram menampilkan distribusi energi frekuensi; pola spektral yang tidak "
-                "wajar pada frekuensi tinggi merupakan 'sidik jari' artefak dekonvolusi yang "
-                "ditinggalkan oleh model generatif AI (Afchar et al., 2025)."
+                "Visualisasi di bawah membantu melakukan inspeksi terhadap karakteristik audio. "
+                "Waveform, CQT Spectrogram, dan profil spektral merupakan visualisasi pendukung, "
+                "bukan bukti otomatis bahwa audio merupakan deepfake. Hasil utama tetap mengacu "
+                "pada prediksi dan confidence model."
             )
 
             with st.spinner("Memproses visualisasi akustik..."):
@@ -444,9 +536,10 @@ if uploaded_file is not None:
                 st.pyplot(fig)
                 plt.close(fig)
                 st.caption(
-                    "Profil energi rata-rata per frekuensi. Area merah (6–8 kHz) menandai zona "
-                    "di mana **spectral peaks** dari proses zero-upsampling paling sering muncul "
-                    "pada audio hasil model generatif (Afchar et al., 2025)."
+                    "Profil energi rata-rata per frekuensi. Area merah 6–8 kHz adalah "
+                    "**area inspeksi frekuensi tinggi**, bukan bukti otomatis bahwa audio "
+                    "merupakan deepfake. Interpretasi utama tetap mengacu pada hasil prediksi "
+                    "dan confidence model."
                 )
 
             # Tab 4 — Attention Heatmap
@@ -463,9 +556,10 @@ if uploaded_file is not None:
                         st.pyplot(fig)
                         plt.close(fig)
                         st.caption(
-                            "Attention heatmap diekstrak dari bobot atensi lapisan **KAN-HS-GAL** "
-                            "melalui forward hook. Area berwarna merah/kuning menunjukkan segmen "
-                            "waktu yang paling diperhatikan model saat membuat keputusan deteksi."
+                            "Heatmap ini bersifat **eksperimental**. Forward hook menangkap tensor "
+                            "dari lapisan terkait attention/KAN-HS-GAL, lalu memproyeksikannya ke "
+                            "domain waktu. Gunakan visualisasi ini sebagai pendukung interpretasi, "
+                            "bukan sebagai bukti kausal tunggal."
                         )
 
                         with st.expander("Detail Layer yang Diekstrak"):
